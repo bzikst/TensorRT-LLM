@@ -30,11 +30,14 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -189,37 +192,91 @@ TllmRuntime::TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, 
     float gpuWeightsPercent, bool useShapeInference)
     : mStream(std::make_shared<CudaStream>())
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
-    , mRuntime{nvinfer1::createInferRuntime(static_cast<bool>(logger) ? *logger : defaultLogger)}
     , mUseShapeInference{useShapeInference}
     , mUserBufferEnabled{false}
 {
     auto const startTime = std::chrono::high_resolution_clock::now();
 
-    switch (rawEngine.getType())
+    // Deduplicate identical engines across executors: e.g. the Whisper main beam executor and
+    // the utility beam=1 executor load the SAME decoder engine file. TensorRT supports multiple
+    // execution contexts over one ICudaEngine sharing its read-only weights (only the per-context
+    // scratch differs), so caching the deserialized engine by path avoids a second multi-GB weight
+    // copy. The owning IRuntime is cached alongside the engine because TensorRT requires the runtime
+    // to outlive engines it created. Per-request decoder/beam state lives in the batch manager, not
+    // in TllmRuntime, so sharing the read-only engine cannot leak state between executors.
+    static std::mutex sEngineCacheMutex;
+    static std::unordered_map<std::string,
+        std::pair<std::weak_ptr<nvinfer1::IRuntime>, std::weak_ptr<nvinfer1::ICudaEngine>>>
+        sEngineCache;
+
+    std::string cacheKey;
+    if (rawEngine.getType() == RawEngine::Type::FilePath)
     {
-    case RawEngine::Type::FilePath:
-    {
-        if (useGpuDirectStorage)
-        {
-            TLLM_LOG_INFO("GDS is used to load the engine!");
-            auto reader = GDSStreamReader(rawEngine.getPath());
-            mEngine.reset(mRuntime->deserializeCudaEngine(reader));
-        }
-        else
-        {
-            auto reader = StreamReader(rawEngine.getPath());
-            mEngine.reset(mRuntime->deserializeCudaEngine(reader));
-        }
-        break;
+        std::error_code ec;
+        auto const canonical = std::filesystem::weakly_canonical(rawEngine.getPath(), ec);
+        cacheKey = ec ? rawEngine.getPath().string() : canonical.string();
     }
-    case RawEngine::Type::AddressWithSize:
-        mEngine.reset(mRuntime->deserializeCudaEngine(rawEngine.getAddress(), rawEngine.getSize()));
-        break;
-    case RawEngine::Type::HostMemory:
-        mEngine.reset(
-            mRuntime->deserializeCudaEngine(rawEngine.getHostMemory()->data(), rawEngine.getHostMemory()->size()));
-        break;
-    default: TLLM_THROW("Unsupported raw engine type.");
+
+    bool reused = false;
+    if (!cacheKey.empty())
+    {
+        std::lock_guard<std::mutex> const lock(sEngineCacheMutex);
+        auto const it = sEngineCache.find(cacheKey);
+        if (it != sEngineCache.end())
+        {
+            auto runtime = it->second.first.lock();
+            auto engine = it->second.second.lock();
+            if (runtime && engine)
+            {
+                mRuntime = std::move(runtime);
+                mEngine = std::move(engine);
+                reused = true;
+                TLLM_LOG_INFO("Reusing shared CUDA engine (deduplicated weights): %s", cacheKey.c_str());
+            }
+        }
+    }
+
+    if (!reused)
+    {
+        mRuntime = std::shared_ptr<nvinfer1::IRuntime>(
+            nvinfer1::createInferRuntime(static_cast<bool>(logger) ? *logger : defaultLogger));
+        switch (rawEngine.getType())
+        {
+        case RawEngine::Type::FilePath:
+        {
+            if (useGpuDirectStorage)
+            {
+                TLLM_LOG_INFO("GDS is used to load the engine!");
+                auto reader = GDSStreamReader(rawEngine.getPath());
+                mEngine = std::shared_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(reader));
+            }
+            else
+            {
+                auto reader = StreamReader(rawEngine.getPath());
+                mEngine = std::shared_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(reader));
+            }
+            break;
+        }
+        case RawEngine::Type::AddressWithSize:
+            mEngine = std::shared_ptr<nvinfer1::ICudaEngine>(
+                mRuntime->deserializeCudaEngine(rawEngine.getAddress(), rawEngine.getSize()));
+            break;
+        case RawEngine::Type::HostMemory:
+            mEngine = std::shared_ptr<nvinfer1::ICudaEngine>(
+                mRuntime->deserializeCudaEngine(rawEngine.getHostMemory()->data(), rawEngine.getHostMemory()->size()));
+            break;
+        default: TLLM_THROW("Unsupported raw engine type.");
+        }
+
+        TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine.");
+        setWeightStreaming(getEngine(), gpuWeightsPercent);
+
+        if (!cacheKey.empty())
+        {
+            std::lock_guard<std::mutex> const lock(sEngineCacheMutex);
+            sEngineCache[cacheKey] = std::make_pair(
+                std::weak_ptr<nvinfer1::IRuntime>(mRuntime), std::weak_ptr<nvinfer1::ICudaEngine>(mEngine));
+        }
     }
 
     auto const elapsedMs
@@ -227,10 +284,13 @@ TllmRuntime::TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, 
 
     TLLM_LOG_INFO("Engine load time %lld ms", elapsedMs);
 
-    TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine.");
+    // Per-runtime resources (NOT shared with the cached engine): engine inspector and the
+    // execution-context scratch buffer. Each executor keeps its own context memory.
     mEngineInspector.reset(mEngine->createEngineInspector());
-    assessLikelihoodOfRuntimeAllocation(*mEngine, *mEngineInspector);
-    setWeightStreaming(getEngine(), gpuWeightsPercent);
+    if (!reused)
+    {
+        assessLikelihoodOfRuntimeAllocation(*mEngine, *mEngineInspector);
+    }
     auto const devMemorySize = mEngine->getDeviceMemorySizeV2();
     mEngineBuffer = mBufferManager.gpu(devMemorySize);
     // Print context memory size for CI/CD to track.
