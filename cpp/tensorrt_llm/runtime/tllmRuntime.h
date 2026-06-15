@@ -222,8 +222,11 @@ private:
 
     BufferManager::CudaStreamPtr mStream;
     BufferManager mBufferManager;
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
+    // shared_ptr (not unique_ptr): identical engines loaded by multiple executors are
+    // deduplicated via a path-keyed cache in the ctor, so several TllmRuntime instances
+    // can share one deserialized ICudaEngine (and its owning IRuntime).
+    std::shared_ptr<nvinfer1::IRuntime> mRuntime;
+    std::shared_ptr<nvinfer1::ICudaEngine> mEngine;
     BufferManager::IBufferPtr mEngineBuffer;
     std::vector<std::unique_ptr<nvinfer1::IExecutionContext>> mContexts;
     std::unique_ptr<ITensor> mDummyTensor;
