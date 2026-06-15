@@ -3058,6 +3058,51 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     return pinnedBlockIds;
 }
 
+void WindowBlockManager::clearBlockKv(BlockPtr const& block)
+{
+    // Zero the block's K/V in every pool it spans, reusing the same per-block indexer
+    // that KVCacheTransferManager::computeBlockPointer uses for normal block copies
+    // (kvCacheTransferManager.cpp:89-98): pick primary/secondary by residency and slice
+    // the pool's block dimension at getMemoryPoolBlockIndex(). A non-layer-first block
+    // slice covers all layers, kvFactor (K and V), heads and tokens of the block.
+    auto const blockIdx = static_cast<std::size_t>(block->getMemoryPoolBlockIndex());
+    auto const isPrimary = block->isPrimary();
+    for (auto const& pool : mPools)
+    {
+        auto const& poolPtr = isPrimary ? pool.primaryPtr : pool.secondaryPtr;
+        if (!poolPtr)
+        {
+            continue;
+        }
+        if (pool.layerFirstLayout)
+        {
+            // Layer-first pools {numLayers, numBlocks, kvFactor, blockSize}: a block is
+            // non-contiguous across layers, so zero it with the same pitched stride math
+            // as copyBlock's layer-first path (kvCacheTransferManager.cpp:121-148). Only the
+            // GPU-resident (primary) case is handled; layer-first pools are recurrent-state
+            // only and never occur on the transformer beam path this fix targets.
+            if (poolPtr->getMemoryType() != runtime::MemoryType::kGPU)
+            {
+                continue;
+            }
+            auto const& shape = poolPtr->getShape();
+            auto const layerStrideBytes = poolPtr->getSizeInBytes() / static_cast<std::size_t>(pool.numLayers);
+            auto const rowBytes = layerStrideBytes / static_cast<std::size_t>(shape.d[1]);
+            auto* base = static_cast<char*>(poolPtr->data()) + blockIdx * rowBytes;
+            TLLM_CUDA_CHECK(cudaMemset2DAsync(base, layerStrideBytes, 0, rowBytes,
+                static_cast<std::size_t>(pool.numLayers), mBufferManager.getStream().get()));
+        }
+        else
+        {
+            // Default layout {numBlocks, numLayers, kvFactor, blockSize}: slicing the block
+            // dimension yields the full per-block slab; setZero issues cudaMemsetAsync on the
+            // manager's stream (bufferManager.cpp).
+            auto blockTensor = runtime::ITensor::slice(poolPtr, blockIdx, 1);
+            mBufferManager.setZero(*blockTensor);
+        }
+    }
+}
+
 std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
@@ -3103,6 +3148,11 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
             sequence.getRequestId(), numBlocksStoredForReuse);
     }
+    // When llmRequest is absent, no beam-0 blocks were stored for prefix reuse above, so
+    // released blocks are truly discarded and their K/V must be scrubbed before reuse to
+    // avoid a future request attending to stale K/V (poison fix). When llmRequest is
+    // present, blocks may be retained in the reuse trie, so their content must be kept.
+    bool const scrubReleasedBlocks = !llmRequest.has_value();
     // Iterate all allocated blocks (including placeholder sentinels at OOW positions);
     // EvictionPolicy::releaseBlock silently skips placeholders.
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
@@ -3118,6 +3168,10 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
         {
+            if (scrubReleasedBlocks && !block->isPlaceholder())
+            {
+                clearBlockKv(block);
+            }
             mEvictionPolicy->releaseBlock(block);
         }
     }

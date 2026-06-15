@@ -1309,6 +1309,12 @@ private:
     //! \brief Calls KVCacheBlock::freeLeafBlock to remove block from search tree.
     void freeLeafBlock(BlockPtr const& block);
 
+    //! \brief Zero the K/V device memory of a block across all of its pools before it
+    //! re-enters the free pool, so a future request cannot attend to a previous
+    //! request's stale K/V in the unused tail of a reused (partial) block. Only safe to
+    //! call for blocks that are NOT retained for prefix reuse. Must not be a placeholder.
+    void clearBlockKv(BlockPtr const& block);
+
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
 
