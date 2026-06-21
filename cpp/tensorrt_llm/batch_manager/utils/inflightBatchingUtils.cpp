@@ -123,6 +123,19 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
         auto const numGenerationToken
             = static_cast<SizeType32>(beforeDecoder) + llmReq.getNumTokens(beam) - llmReq.mPromptLen;
         auto const hostOffset = numGenerationToken - beamFragmentSize;
+        // VOICEE rc15-poison guard: a stale/foreign decoder slot on a warm single
+        // executor can drive numGenerationToken < beamFragmentSize -> negative
+        // hostOffset -> ITensor::slice with a negative offset aborts forwardSync.
+        // Skip the corrupt generation-logits copy and log the offending state.
+        if (hostOffset < 0 || beamFragmentSize < 0)
+        {
+            TLLM_LOG_ERROR(
+                "[VOICEE-POISON] genLogits underflow: reqId=%ld beforeDecoder=%d numTokens=%d promptLen=%d "
+                "fragSize=%d dropped=%d beamFragSize=%d numGenTok=%d hostOffset=%d beam=%d reqBeamWidth=%d",
+                llmReq.mRequestId, (int) beforeDecoder, llmReq.getNumTokens(beam), llmReq.mPromptLen, fragmentSize,
+                droppedSize, beamFragmentSize, numGenerationToken, hostOffset, beam, reqBeamWidth);
+            continue;
+        }
 
         // [beamWidth, GENERATION_LOGITS_BUFFER_LENGTH, vocabSizePadded] -> [beamFragmentSize, vocabSizePadded]
         auto beamDeviceTensorPtr = ITensor::slice(transposeBufferPtr, {beam, 0}, beamFragmentSize);

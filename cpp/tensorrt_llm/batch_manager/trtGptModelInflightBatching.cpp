@@ -2454,8 +2454,26 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                     SizeType32 offset
                         = (seqSlot * mOperatingBeamWidth + beam) * getMaxSequenceLen() + beginLogProbsOffset;
                     auto const generatedLength = seqLen - llmReq->mPromptLen;
-                    std::vector<float> logProbs(logProbsPtr + offset, logProbsPtr + offset + generatedLength);
-                    llmReq->setLogProbs(logProbs, beam);
+                    // VOICEE rc15-poison guard: on a warm single executor mixing beam
+                    // transcription with beam=1 gather/sampling probes, a stale decoder
+                    // slot can yield seqLen < mPromptLen -> negative span -> the
+                    // std::vector(begin, end<begin) ctor throws std::length_error
+                    // mid-forwardSync -> terminate/abort. Skip the corrupt logProbs
+                    // write (tokens and cumLogProb for the beam are already set) and
+                    // log the offending state so the root field can be traced.
+                    if (generatedLength < 0 || offset < 0)
+                    {
+                        TLLM_LOG_ERROR(
+                            "[VOICEE-POISON] logProbs underflow: reqId=%ld seqLen=%d promptLen=%d genLen=%d offset=%d "
+                            "seqSlot=%d beam=%d reqBeamWidth=%d operBeamWidth=%d maxSeqLen=%d",
+                            llmReq->mRequestId, seqLen, llmReq->mPromptLen, generatedLength, offset, seqSlot, beam,
+                            reqBeamWidth, mOperatingBeamWidth, getMaxSequenceLen());
+                    }
+                    else
+                    {
+                        std::vector<float> logProbs(logProbsPtr + offset, logProbsPtr + offset + generatedLength);
+                        llmReq->setLogProbs(logProbs, beam);
+                    }
                 }
             }
 
